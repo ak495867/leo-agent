@@ -13,12 +13,14 @@ generates exploits, audits findings, applies patches, and learns from each sessi
 </p>
 
 ---
+## Demo
 
 ![Startup](assets/startup.png)
 
 ---
 
 ![Main](assets/main.png)
+> *Interactive dashboard showing live scan progress, phase tracking, and real-time logs.*
 
 ---
 
@@ -61,11 +63,6 @@ Leo uses a pipeline of LLM-powered agents to autonomously audit your code:
 | 6 | **Patch** | Creates and applies targeted patches |
 | 7 | **Memory Update** | Persists new patterns for future scans |
 
-## Demo
-
-![Leo TUI](https://via.placeholder.com/720x400/1a1a2e/e0e0e0?text=Leo+Terminal+UI)
-
-> *Interactive dashboard showing live scan progress, phase tracking, and real-time logs.*
 
 ## Commands
 
