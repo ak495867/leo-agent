@@ -1,8 +1,8 @@
 <p align="center">
-[![npm version](https://img.shields.io/npm/v/@leo-agent/cli?color=gold&label=npm&logo=npm)](https://www.npmjs.com/package/@leo-agent/cli)
-[![npm downloads](https://img.shields.io/npm/dw/@leo-agent/cli?color=gold&logo=npm)](https://www.npmjs.com/package/@leo-agent/cli)
-[![Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-[![Node >=20](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
+<img src="https://img.shields.io/npm/v/@leo-agent/cli" alt="npm version">
+<img src="https://img.shields.io/npm/dw/@leo-agent/cli" alt="npm downloads">
+<img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="Apache 2.0">
+<img src="https://img.shields.io/badge/node-%3E%3D20-brightgreen" alt="Node >=20">
 </p>
 
 <h1 align="center">🦁 Leo</h1>
