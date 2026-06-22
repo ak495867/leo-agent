@@ -123,6 +123,4 @@ node bin/leo scan
 4. Publish: `npm publish --access public`
 5. Push tags: `git push --tags`
 
-## Questions?
 
-Open a discussion at [github.com/ak495867/leo-agent/discussions](https://github.com/ak495867/leo-agent/discussions).
