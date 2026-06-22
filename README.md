@@ -14,6 +14,14 @@ generates exploits, audits findings, applies patches, and learns from each sessi
 
 ---
 
+![Startup](assets/startup.png)
+
+---
+
+![Main](assets/main.png)
+
+---
+
 ## Install
 
 ```bash
