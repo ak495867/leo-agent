@@ -1,0 +1,3 @@
+#!/usr/bin/env node
+// CJS shim — loads the compiled Leo CLI
+require("../dist/cli.js");
