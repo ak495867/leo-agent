@@ -1,4 +1,5 @@
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { LeoConfig, loadConfig } from "../utils/config.js";
 import { buildSnapshot, CodebaseSnapshot } from "../core/snapshot.js";
@@ -16,6 +17,15 @@ import { runPatch, PatchSet } from "./patch.js";
 import { runMemory, MemoryUpdate } from "./memory.js";
 
 import { applyPatchSet } from "../core/patcher.js";
+import { createSnapshotBatches, snapshotForBatch } from "../analysis/batching.js";
+import { runTaintHeuristics } from "../analysis/taint.js";
+import { scanDependencies } from "../analysis/osv.js";
+import { correlateBatches } from "./correlate.js";
+import { verifyFindings } from "./verify.js";
+
+async function writeEarlyArtifact(sessionDir: string, name: string, obj: unknown): Promise<void> {
+  await fs.writeFile(path.join(sessionDir, `${name}.json`), JSON.stringify(obj, null, 2), { encoding: "utf8", mode: 0o600 });
+}
 
 /**
  * Run a full Leo session.
@@ -75,10 +85,10 @@ export async function runCoordinator(
   // 3️⃣  Load top patterns from memory DB (inject into all sub‑agents)
   // -------------------------------------------------------------------
   reportProgress("memory", "running", "loading patterns");
-  const memory = await MemoryDB.getInstance();
-  const topPatterns = memory.getTopPatterns(50);
+  const memory = await MemoryDB.getInstance(projectRoot);
+  const topPatterns = config.memory_enabled === false ? [] : memory.getTopPatterns(50);
   reportProgress("memory", "done", `${topPatterns.length} patterns`);
-  await logger.write(`Loaded ${topPatterns.length} top pattern(s) from memory DB`);
+  await logger.write(`Loaded ${topPatterns.length} project-scoped pattern(s) from memory DB`);
   pushLog("memory", `Loaded ${topPatterns.length} known vulnerability patterns from memory`);
 
   // -------------------------------------------------------------------
@@ -88,85 +98,129 @@ export async function runCoordinator(
   const snapshot: CodebaseSnapshot = await buildSnapshot(projectRoot);
   reportProgress("snapshot", "done", `${snapshot.file_count} files`);
   await logger.write(`Snapshot built – ${snapshot.file_count} file(s) captured`);
-  pushLog("snapshot", `Codebase snapshot built – ${snapshot.file_count} files analysed`);
+  pushLog("snapshot", `Codebase snapshot built – ${snapshot.file_count} files analysed; ${snapshot.skipped_files.length} skipped`);
+
+  const snapshotHash = createHash("sha256").update(JSON.stringify(Object.entries(snapshot.files).sort(([a], [b]) => a.localeCompare(b)))).digest("hex");
+  await writeEarlyArtifact(sessionDir, "snapshot_manifest", { snapshot_hash: snapshotHash, file_count: snapshot.file_count, total_bytes: snapshot.total_bytes, skipped_files: snapshot.skipped_files, snapshot_at: snapshot.snapshot_at });
+  const configFingerprint = createHash("sha256").update(JSON.stringify({ pipeline: "0.6.0", model: config.default_model, scan_depth: config.scan_depth, patterns: topPatterns })).digest("hex");
+  const cachedBatches: Record<string, { batch_id: string; config_fingerprint?: string; recon: ReconReport; exploit: ExploitMap; audit: AuditReport }> = {};
+  if (resumeFrom) {
+    if (!/^[a-f0-9]{6,32}$/i.test(resumeFrom)) throw new Error("Invalid resume session ID.");
+    const home = process.env.HOME ?? process.env.USERPROFILE ?? process.cwd();
+    const oldDir = path.join(home, ".leo", "sessions", projHash, resumeFrom);
+    const manifest = JSON.parse(await fs.readFile(path.join(oldDir, "snapshot_manifest.json"), "utf8"));
+    if (manifest.snapshot_hash !== snapshotHash) throw new Error("Cannot resume: the project snapshot differs from the saved session. Start a fresh scan to avoid mixing results from different source states.");
+    const oldBatchDir = path.join(oldDir, "batches");
+    try {
+      for (const name of await fs.readdir(oldBatchDir)) {
+        if (!name.endsWith(".json")) continue;
+        try { const item = JSON.parse(await fs.readFile(path.join(oldBatchDir, name), "utf8")); if (item?.batch_id) cachedBatches[item.batch_id] = item; } catch { /* ignore corrupt individual checkpoint; it will be recomputed */ }
+      }
+    } catch { /* legacy session without batch checkpoints: recompute */ }
+
+  }
 
   // -------------------------------------------------------------------
-  // 5️⃣  Run Recon agent
+  // 5️⃣  Bounded multi-batch analysis. Each file is sent exactly once to
+  //      the per-batch agents; aggregate findings are correlated globally.
   // -------------------------------------------------------------------
-  reportProgress("recon", "running");
-  let recon: ReconReport | null;
+  const batches = createSnapshotBatches(snapshot, 48_000);
+  await writeEarlyArtifact(sessionDir, "batch_manifest", { total_batches: batches.length, batches: batches.map(b => ({ id: b.id, index: b.index, total: b.total, files: Object.keys(b.files), byte_count: b.byte_count })) });
+  await logger.write(`Analysis split into ${batches.length} deterministic batch(es); ${Object.keys(cachedBatches).length} cached checkpoints available`);
+  reportProgress("recon", "running", `${batches.length} batches`);
+  const reconReports: ReconReport[] = [];
+  const exploitReports: ExploitMap[] = [];
+  const auditReports: AuditReport[] = [];
+  for (const batch of batches) {
+    const batchSnapshot = snapshotForBatch(snapshot, batch);
+    await logger.write(`Batch ${batch.index}/${batch.total}: ${batch.id}, ${batchSnapshot.file_count} files, ${batch.byte_count} bytes`);
+    let cached: (typeof cachedBatches)[string] | undefined = cachedBatches[batch.id];
+    if (cached && cached.config_fingerprint !== configFingerprint) cached = undefined;
+    if (cached) await logger.write(`Reusing verified snapshot/config checkpoint for ${batch.id}`);
+    else {
+      const batchRecon = await runRecon(batchSnapshot, config, topPatterns);
+      if (!batchRecon) throw new Error(`Recon failed for ${batch.id}; no findings will be reported as a successful scan.`);
+      const batchExploit = await runExploit(batchRecon, batchSnapshot, config, topPatterns);
+      if (!batchExploit || !Array.isArray(batchExploit.scenarios)) throw new Error(`Exploit analysis failed for ${batch.id}.`);
+      const batchAudit = await runAudit(batchRecon, batchExploit, batchSnapshot, config, topPatterns);
+      if (!batchAudit || !Array.isArray(batchAudit.findings)) throw new Error(`Audit analysis failed for ${batch.id}.`);
+      cached = { batch_id: batch.id, config_fingerprint: configFingerprint, recon: batchRecon, exploit: batchExploit, audit: batchAudit };
+      const batchDir = path.join(sessionDir, "batches"); await fs.mkdir(batchDir, { recursive: true, mode: 0o700 });
+      await writeEarlyArtifact(batchDir, batch.id, cached);
+    }
+    reconReports.push(cached.recon); exploitReports.push(cached.exploit); auditReports.push(cached.audit);
+    reportProgress("recon", "running", `completed ${batch.index}/${batch.total}`);
+  }
+
+  const unique = <T>(items: T[]): T[] => [...new Map(items.map(item => [JSON.stringify(item), item])).values()];
+  const recon: ReconReport = {
+    project_hash: projHash, scanned_at: new Date().toISOString(),
+    tech_stack: {
+      languages: unique(reconReports.flatMap(r => r.tech_stack?.languages ?? [])),
+      frameworks: unique(reconReports.flatMap(r => r.tech_stack?.frameworks ?? [])),
+      runtime_versions: Object.assign({}, ...reconReports.map(r => r.tech_stack?.runtime_versions ?? {})),
+      package_managers: unique(reconReports.flatMap(r => r.tech_stack?.package_managers ?? [])),
+    },
+    entry_points: unique(reconReports.flatMap(r => r.entry_points ?? [])),
+    trust_boundaries: unique(reconReports.flatMap(r => r.trust_boundaries ?? [])),
+    dependencies: unique(reconReports.flatMap(r => r.dependencies ?? [])),
+    complexity_hotspots: unique(reconReports.flatMap(r => r.complexity_hotspots ?? [])),
+    secrets_surface: unique(reconReports.flatMap(r => r.secrets_surface ?? [])),
+  };
+  const exploitMap: ExploitMap = { scenarios: unique(exploitReports.flatMap((r, i) => (r.scenarios ?? []).map(s => ({ ...s, id: `${batches[i]?.id ?? "batch"}:${s.id}` })))) };
+  reportProgress("recon", "done", `${batches.length} batches; ${snapshot.file_count} files`);
+  reportProgress("exploit", "done", `${exploitMap.scenarios.length} scenarios`);
+  reportProgress("audit", "running", "cross-batch aggregation");
+
+  // Merge deterministic static-analysis results with model findings.
+  const taintReport = runTaintHeuristics(snapshot.files);
+  const dependencyReport = await scanDependencies(snapshot.files);
+  const preCorrelation: AuditReport[] = [...auditReports, taintReport, { findings: dependencyReport.findings, rejected_findings: [] }];
+  const correlated = await correlateBatches(preCorrelation, config, Object.keys(snapshot.files));
+  let auditReport: AuditReport & { verification?: unknown } = correlated.report;
+  await logger.write(`Cross-batch correlation completed: ${correlated.chains.length} chain(s); ${auditReport.findings.length} unique candidate finding(s)`);
+
+  // Independent verifier challenges every candidate. If verifier transport
+  // fails, findings remain visible and explicitly unverified.
   try {
-    recon = await runRecon(snapshot, config, topPatterns);
-  } catch (err: any) {
-    pushLog("recon", `✖ Recon agent threw: ${err?.message ?? err}`);
-    await logger.write(`✖ Recon agent threw: ${err?.message ?? err}`);
-    throw new Error(`Recon phase failed: ${err?.message ?? err}`);
+    auditReport = await verifyFindings(auditReport, snapshot.files, config);
+  } catch (err) {
+    await logger.write(`Verifier unavailable: ${(err as Error).message}; candidates retained as needs_review`);
+    auditReport = { ...auditReport, findings: auditReport.findings.map(f => ({ ...f, verification: "needs_review", verification_confidence: 0, verification_rationale: "Verifier unavailable; requires human review." })) };
   }
-  if (!recon) {
-    reportProgress("recon", "error");
-    await logger.write("✖ Recon agent returned null (parse_failed after retries). Aborting.");
-    pushLog("recon", "✖ Recon agent failed after retries — aborting");
-    await logger.flush();
-    throw new Error("Recon agent failed: unable to parse codebase structure.");
-  }
-  const entryPoints = recon.entry_points ?? [];
-  reportProgress("recon", "done", `${entryPoints.length} entry points`);
-  await logger.write(`Recon completed – ${entryPoints.length} entry point(s)`);
-  pushLog("recon", `Reconnaissance identified ${entryPoints.length} entry points`);
-
-  // -------------------------------------------------------------------
-  // 6️⃣  Run Exploit & Audit in parallel (they're independent)
-  //      Audit NOW receives the REAL ExploitMap for cross‑referencing.
-  // -------------------------------------------------------------------
-  reportProgress("exploit", "running");
-  reportProgress("audit", "running");
-  let exploit: ExploitMap | null;
-  let audit: AuditReport | null;
-  try {
-    [exploit, audit] = await Promise.all([
-      runExploit(recon, snapshot, config, topPatterns),
-      runAudit(recon, { scenarios: [] } as ExploitMap, snapshot, config, topPatterns),
-    ]);
-  } catch (err: any) {
-    pushLog("exploit", `✖ Exploit/Audit phase threw: ${err?.message ?? err}`);
-    await logger.write(`✖ Exploit/Audit phase threw: ${err?.message ?? err}`);
-    throw new Error(`Exploit/Audit phase failed: ${err?.message ?? err}`);
-  }
-
-  // Handle parse_failed gracefully – treat missing outputs as empty.
-  const exploitMap: ExploitMap = exploit && exploit.scenarios ? exploit : { scenarios: [] };
-  const auditReport: AuditReport = audit && audit.findings ? audit : { findings: [] };
-
   const scenarioCount = exploitMap.scenarios.length;
   const findingCount = auditReport.findings.length;
+  reportProgress("audit", "done", `${findingCount} verified or review-required findings`);
+  await logger.write(`Audit completed – ${findingCount} retained finding(s); ${auditReport.rejected_findings?.length ?? 0} rejected finding(s)`);
+  pushLog("audit", `Audit completed across ${batches.length} batches; ${findingCount} findings retained`);
 
-  reportProgress("exploit", "done", `${scenarioCount} scenarios`);
-  reportProgress("audit", "done", `${findingCount} findings`);
-
-  await logger.write(`Exploit completed – ${scenarioCount} scenario(s)`);
-  pushLog("exploit", `Exploitation phase generated ${scenarioCount} attack scenario(s)`);
-  await logger.write(`Audit completed – ${findingCount} finding(s)`);
-  pushLog("audit", `Audit phase discovered ${findingCount} potential finding(s)`);
+  await writeEarlyArtifact(sessionDir, "taint_report", { findings: taintReport.findings, rejected_findings: taintReport.rejected_findings });
+  await writeEarlyArtifact(sessionDir, "project_analysis", taintReport.project_analysis);
+  await writeEarlyArtifact(sessionDir, "dependency_audit", dependencyReport);
+  await writeEarlyArtifact(sessionDir, "correlations", { cross_file_chains: correlated.chains });
+  if ((auditReport as any).verification) await writeEarlyArtifact(sessionDir, "verification", (auditReport as any).verification);
 
   // -------------------------------------------------------------------
   // 7️⃣  Run Patch agent
   // -------------------------------------------------------------------
   reportProgress("patch", "running");
-  let patchResult: PatchSet | null;
+  const patchSets: PatchSet[] = [];
   try {
-    patchResult = await runPatch(
-      exploitMap,
-      auditReport,
-      snapshot,
-      config,
-      topPatterns
-    );
+    for (const batch of batches) {
+      const batchSnapshot = snapshotForBatch(snapshot, batch);
+      const batchFiles = new Set(Object.keys(batch.files));
+      const localAudit: AuditReport = { findings: auditReport.findings.filter(f => batchFiles.has(f.file) && f.verification === "confirmed"), rejected_findings: [] };
+      const localExploit: ExploitMap = { scenarios: exploitMap.scenarios.filter(s => batchFiles.has(s.target_file.replace(/^.*?:/, ""))) };
+      if (!localAudit.findings.length) continue;
+      const result = await runPatch(localExploit, localAudit, batchSnapshot, config, topPatterns);
+      if (result?.patches) patchSets.push(result);
+    }
   } catch (err: any) {
     pushLog("patch", `✖ Patch agent threw: ${err?.message ?? err}`);
     await logger.write(`✖ Patch agent threw: ${err?.message ?? err}`);
     throw new Error(`Patch phase failed: ${err?.message ?? err}`);
   }
-  const patchSet: PatchSet = patchResult && patchResult.patches ? patchResult : { patches: [] };
+  const patchSet: PatchSet = { patches: patchSets.flatMap(p => p.patches) };
   const patchCount = patchSet.patches.length;
   reportProgress("patch", "done", `${patchCount} patches`);
   await logger.write(`PatchSet generated – ${patchCount} patch(es)`);
@@ -176,12 +230,16 @@ export async function runCoordinator(
   // 8️⃣  Apply patches (only READY ones are applied)
   // -------------------------------------------------------------------
   reportProgress("apply", "running");
-  if (patchSet.patches.length > 0) {
-    await applyPatchSet(patchSet, projectRoot, logger);
-    const readyCount = patchSet.patches.filter(p => p.status === "READY").length;
-    reportProgress("apply", "done", `${readyCount} applied`);
+  let appliedPatchCount = 0;
+  if (patchSet.patches.length > 0 && config.auto_apply_patches === true) {
+    appliedPatchCount = await applyPatchSet(patchSet, projectRoot, logger, sessionDir);
+    reportProgress("apply", "done", `${appliedPatchCount} applied`);
     await logger.write("Patch application finished");
-    pushLog("apply", `Applied ${readyCount} patch(es) to the codebase`);
+    pushLog("apply", `Applied ${appliedPatchCount} patch(es) to the codebase`);
+  } else if (patchSet.patches.length > 0) {
+    reportProgress("apply", "done", "approval required");
+    await logger.write("Patch application skipped: auto_apply_patches is disabled. Review patches.json and explicitly enable application.");
+    pushLog("apply", "Generated patches saved for human review; no source files modified");
   } else {
     reportProgress("apply", "done", "nothing to apply");
     await logger.write("No patches to apply – skipping patch application.");
@@ -189,58 +247,49 @@ export async function runCoordinator(
   }
 
   // -------------------------------------------------------------------
-  // 9️⃣  Compute session scores
+  // 9️⃣  Record operational counts only. Detection precision/recall require
+  //      ground-truth labels and are never inferred from patch counts.
   // -------------------------------------------------------------------
-  const totalFindings =
-    exploitMap.scenarios.length + auditReport.findings.length;
-  const readyPatches = patchSet.patches.filter((p) => p.status === "READY").length;
-
-  const coverageScore = snapshot.file_count > 0 ? 1.0 : 0.0;
-  const precisionScore =
-    totalFindings > 0
-      ? Math.min(readyPatches / totalFindings, 1.0)
-      : 0.0;
-  const patchSuccessRate =
-    patchSet.patches.length > 0 ? readyPatches / patchSet.patches.length : 0.0;
-  const noveltyScore = topPatterns.length === 0 ? 1.0 : 0.5;
-  const compositeScore =
-    (coverageScore + precisionScore + patchSuccessRate + noveltyScore) / 4;
-
+  const totalFindings = auditReport.findings.length;
   const computedScores = {
-    coverage_score: coverageScore,
-    precision_score: precisionScore,
-    patch_success_rate: patchSuccessRate,
-    novelty_score: noveltyScore,
-    composite_score: compositeScore,
+    files_analyzed: snapshot.file_count,
+    files_skipped: snapshot.skipped_files.length,
+    exploit_scenarios: exploitMap.scenarios.length,
+    findings_reported: totalFindings,
+    patches_proposed: patchSet.patches.length,
+    patches_applied: appliedPatchCount,
+    benchmark_metrics: null,
+    batches_processed: batches.length,
+    taint_candidates: taintReport.findings.length,
+    dependencies_queried: dependencyReport.queried,
+    dependency_scan_available: dependencyReport.status === "unavailable" ? 0 : 1,
+    verified_findings: auditReport.findings.filter(f => f.verification === "confirmed").length,
+    needs_review_findings: auditReport.findings.filter(f => f.verification === "needs_review").length,
+    cross_file_chains: correlated.chains.length,
   };
 
   // -------------------------------------------------------------------
   // 🔟  Run Memory agent and persist its update
   // -------------------------------------------------------------------
   reportProgress("memory-update", "running");
-  let memoryUpdate: MemoryUpdate | null;
-  try {
-    memoryUpdate = await runMemory(
-      recon,
-      exploitMap,
-      auditReport,
-      patchSet,
-      computedScores,
-      config,
-      topPatterns
-    );
-  } catch (err: any) {
-    pushLog("memory-update", `✖ Memory agent threw: ${err?.message ?? err}`);
-    await logger.write(`✖ Memory agent threw: ${err?.message ?? err}`);
-    throw new Error(`Memory-update phase failed: ${err?.message ?? err}`);
+  let memoryUpdate: MemoryUpdate | null = null;
+  if (config.memory_enabled !== false) {
+    try {
+      memoryUpdate = await runMemory(recon, exploitMap, auditReport, patchSet, computedScores, config, topPatterns);
+    } catch (err: any) {
+      // Memory learning is optional and must never invalidate a completed audit.
+      pushLog("memory-update", `Memory update skipped: ${err?.message ?? err}`);
+      await logger.write(`Memory update skipped: ${err?.message ?? err}`);
+    }
   }
 
   const newPatterns = memoryUpdate?.new_patterns ?? [];
   const falsePositives = memoryUpdate?.false_positives ?? [];
 
-  if (memoryUpdate && newPatterns.length > 0) {
-    await logger.write(`MemoryUpdate generated – ${newPatterns.length} new pattern(s)`);
-    pushLog("memory-update", `Memory updated with ${newPatterns.length} new pattern(s) and ${falsePositives.length} false positive(s)`);
+  const newTemplates = memoryUpdate?.new_patch_templates ?? [];
+  if (config.memory_enabled !== false && memoryUpdate && (newPatterns.length > 0 || newTemplates.length > 0)) {
+    await logger.write(`MemoryUpdate generated – ${newPatterns.length} new pattern(s), ${newTemplates.length} patch template(s)`);
+    pushLog("memory-update", `Memory updated with ${newPatterns.length} new pattern(s) and ${newTemplates.length} patch template(s)`);
 
     // Persist new patterns to the DB
     const now = new Date().toISOString();
@@ -255,37 +304,32 @@ export async function runCoordinator(
         created_at: now,
       });
     }
-    for (const fp of falsePositives) {
-      memory.insertFalsePositive({
-        id: `${sessionId}-fp-${Math.random().toString(36).slice(2, 8)}`,
-        pattern_id: "",
-        reason: fp.reason ?? "",
-        code_context: fp.code_context ?? "",
+    for (const template of newTemplates) {
+      const patternId = memory.getPatternIdByName(template.vulnerability_pattern_name);
+      if (!patternId) { await logger.write(`Skipped patch template without a known pattern: ${template.vulnerability_pattern_name}`); continue; }
+      memory.insertPatchTemplate({
+        id: `${sessionId}-tpl-${Buffer.from(template.vulnerability_pattern_name + template.language).toString("hex").slice(0, 32)}`,
+        vulnerability_pattern_id: patternId,
+        language: template.language,
+        description: template.description,
+        before_pattern: template.before_pattern,
+        after_pattern: template.after_pattern,
         created_at: now,
       });
     }
     reportProgress("memory-update", "done", `${newPatterns.length} new patterns`);
   } else {
     reportProgress("memory-update", "done", "skipped");
-    await logger.write("Memory agent returned null – skipping memory update.");
+    await logger.write("Memory disabled, agent returned no updates, or no reusable patterns/templates were produced.");
     pushLog("memory-update", "No memory updates — agent returned no changes");
   }
-
-  // Persist session score
-  memory.insertSessionScore({
-    session_id: sessionId,
-    project_hash: projHash,
-    ...computedScores,
-    model_used: config.default_model,
-    created_at: new Date().toISOString(),
-  });
 
   // -------------------------------------------------------------------
   // 1️⃣1️⃣  Write all artefacts (JSON) to session directory
   // -------------------------------------------------------------------
   const writeJSON = async (name: string, obj: any) => {
     const p = path.join(sessionDir, `${name}.json`);
-    await fs.writeFile(p, JSON.stringify(obj, null, 2), "utf-8");
+    await fs.writeFile(p, JSON.stringify(obj, null, 2), { encoding: "utf-8", mode: 0o600 });
   };
 
   await writeJSON("recon", recon);
@@ -293,6 +337,7 @@ export async function runCoordinator(
   await writeJSON("audit", auditReport);
   await writeJSON("patches", patchSet);
   await writeJSON("memory_update", memoryUpdate ?? {});
+  await writeJSON("snapshot_manifest", { snapshot_hash: snapshotHash, file_count: snapshot.file_count, total_bytes: snapshot.total_bytes, skipped_files: snapshot.skipped_files, snapshot_at: snapshot.snapshot_at });
 
   // Update session.json with final scores
   const finalMeta = {
@@ -303,13 +348,13 @@ export async function runCoordinator(
   await writeJSON("session", finalMeta);
 
   await logger.write(`=== Leo session ${sessionId} completed ===`);
-  pushLog("session", `Session ${sessionId} completed — ${totalFindings} total findings, ${readyPatches} patches applied`);
+  pushLog("session", `Session ${sessionId} completed — ${totalFindings} total findings, ${appliedPatchCount} patches applied`);
   await logger.flush();
 
   return {
     sessionId,
     scores: computedScores,
-    patchesApplied: readyPatches,
+    patchesApplied: appliedPatchCount,
     totalFindings,
   };
 }

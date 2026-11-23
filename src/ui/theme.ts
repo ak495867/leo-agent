@@ -82,27 +82,6 @@ export function progressBar(value: number, width = 10): string {
 }
 
 /**
- * Return a human‑readable interpretation for a score 0‑1.
- */
-export function interpretScore(value: number): { label: string; color: string } {
-  if (value >= 0.9) return { label: 'Excellent', color: colors.success };
-  if (value >= 0.7) return { label: 'Good', color: colors.info };
-  if (value >= 0.5) return { label: 'Fair', color: colors.warning };
-  return { label: 'Needs Work', color: colors.error };
-}
-
-/**
- * Map internal score keys to display labels.
- */
-export const SCORE_LABELS: Record<string, string> = {
-  coverage_score: 'Coverage',
-  precision_score: 'Precision',
-  patch_success_rate: 'Patch Rate',
-  novelty_score: 'Novelty',
-  composite_score: 'Overall',
-};
-
-/**
  * Phase labels for the scan dashboard.
  */
 export const PHASE_LABELS: Record<string, string> = {

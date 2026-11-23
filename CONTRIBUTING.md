@@ -48,7 +48,10 @@ npm install
 # Build
 npm run build
 
-# Test locally
+# Run regression tests
+npm test
+
+# Test a real scan locally after configuring OpenRouter
 node bin/leo scan
 ```
 
@@ -61,6 +64,8 @@ leo/
 ├── src/
 │   ├── agents/          # AI agent implementations
 │   │   ├── prompts/     # Agent system prompts
+│   │   ├── verify.ts    # Independent finding verifier
+│   │   ├── correlate.ts # Cross-batch evidence correlation
 │   │   ├── coordinator.ts
 │   │   ├── recon.ts
 │   │   ├── exploit.ts
@@ -69,6 +74,7 @@ leo/
 │   │   └── memory.ts
 │   ├── api/             # OpenRouter API client
 │   │   └── openrouter.ts
+│   ├── analysis/        # Batching, taint, OSV, deduplication, evaluation
 │   ├── core/            # Core modules
 │   │   ├── memory-db.ts
 │   │   ├── session.ts
@@ -119,7 +125,7 @@ node bin/leo scan
 
 1. Update version in `package.json`
 2. Run `npm run build`
-3. Commit and tag: `git tag v0.2.0`
+3. Commit and tag: `git tag v0.3.0`
 4. Publish: `npm publish --access public`
 5. Push tags: `git push --tags`
 

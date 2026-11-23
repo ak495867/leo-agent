@@ -1,6 +1,7 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { projectHash } from "../utils/hash.js";
+import { randomUUID } from "node:crypto";
 
 /**
  * Information stored in each session's `session.json`.
@@ -10,13 +11,7 @@ export interface SessionMeta {
   project_hash: string;
   created_at: string; // ISO timestamp
   config_snapshot?: any; // copy of LeoConfig at start of session
-  scores?: {
-    coverage_score?: number;
-    precision_score?: number;
-    patch_success_rate?: number;
-    novelty_score?: number;
-    composite_score?: number;
-  };
+  scores?: Record<string, number | null | undefined>;
   model_used?: string;
 }
 
@@ -45,12 +40,12 @@ export async function createSession(
 ): Promise<{ sessionDir: string; meta: SessionMeta }> {
   const projHash = projectHash(projectRoot);
   const sessionsRoot = getProjectSessionRoot(projectRoot);
-  await fs.mkdir(sessionsRoot, { recursive: true });
+  await fs.mkdir(sessionsRoot, { recursive: true, mode: 0o700 });
 
   // short 6‑char hex ID (derived from timestamp)
-  const sessionId = Date.now().toString(16).slice(-6);
+  const sessionId = randomUUID().replace(/-/g, "").slice(0, 12);
   const sessionDir = path.join(sessionsRoot, sessionId);
-  await fs.mkdir(sessionDir, { recursive: true });
+  await fs.mkdir(sessionDir, { recursive: false, mode: 0o700 });
 
   const meta: SessionMeta = {
     session_id: sessionId,
@@ -61,7 +56,7 @@ export async function createSession(
 
   // write session.json
   const sessionPath = path.join(sessionDir, "session.json");
-  await fs.writeFile(sessionPath, JSON.stringify(meta, null, 2), "utf-8");
+  await fs.writeFile(sessionPath, JSON.stringify(meta, null, 2), { encoding: "utf-8", mode: 0o600 });
 
   // update the per‑project index (append entry)
   const indexPath = path.join(sessionsRoot, "index.json");
@@ -78,7 +73,7 @@ export async function createSession(
     scores: meta.scores ?? {},
     model_used: meta.model_used ?? "",
   });
-  await fs.writeFile(indexPath, JSON.stringify(index, null, 2), "utf-8");
+  await fs.writeFile(indexPath, JSON.stringify(index, null, 2), { encoding: "utf-8", mode: 0o600 });
 
   return { sessionDir, meta };
 }
@@ -90,6 +85,7 @@ export async function loadSession(
   projectRoot: string,
   sessionId: string
 ): Promise<SessionMeta> {
+  if (!/^[a-f0-9]{6,32}$/i.test(sessionId)) throw new Error("Invalid session ID.");
   const sessionDir = path.join(getProjectSessionRoot(projectRoot), sessionId);
   const sessionPath = path.join(sessionDir, "session.json");
   const raw = await fs.readFile(sessionPath, "utf-8");

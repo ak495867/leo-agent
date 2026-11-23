@@ -1,0 +1,6 @@
+[
+  { "id": "cmd-injection-python", "file": "fixtures/security/vulnerable/command-injection.py", "expected": "vulnerable", "category": "COMMAND_INJECTION", "line": 6 },
+  { "id": "sql-injection-js", "file": "fixtures/security/vulnerable/sql-injection.js", "expected": "vulnerable", "category": "SQL_INJECTION", "line": 3 },
+  { "id": "parameterized-query-js", "file": "fixtures/security/safe/parameterized-query.js", "expected": "safe" },
+  { "id": "fixed-command-python", "file": "fixtures/security/safe/fixed-command.py", "expected": "safe" }
+]

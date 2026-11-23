@@ -1,96 +1,47 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { SessionLogger } from "../utils/logger.js";
 
-/**
- * Apply a PatchSet safely.
- *
- * For each patch whose `status` is "READY":
- *   1️⃣ Write a backup copy `<filename>.leo-backup` containing the original file.
- *   2️⃣ Verify that the original block exists in the current file.
- *   3️⃣ Replace the original block with the patched block.
- *   4️⃣ Log success / failure via the provided SessionLogger.
- *
- * Patches with `status: "DEFERRED"` are skipped (they require human review).
- *
- * @param patchSet   The PatchSet returned by the Patch agent.
- * @param projectRoot Absolute path to the project root (where Leo was invoked).
- * @param logger     Instance of SessionLogger for incremental log output.
- */
 export async function applyPatchSet(
-  patchSet: { patches: Array<{
-    id: string;
-    file: string;
-    original_block: string;
-    patched_block: string;
-    status: "READY" | "DEFERRED";
-    commit_message: string;
-  }>},
-  projectRoot: string,
-  logger: SessionLogger
-): Promise<void> {
+  patchSet: { patches: Array<{ id: string; file: string; original_block: string; patched_block: string; status: "READY" | "DEFERRED"; commit_message: string }> },
+  projectRoot: string, logger: SessionLogger, sessionDir: string
+): Promise<number> {
+  let applied = 0;
+  const root = await fs.realpath(projectRoot);
+  const backupDir = path.join(sessionDir, "backups");
+  await fs.mkdir(backupDir, { recursive: true, mode: 0o700 });
+  const backedUp = new Set<string>();
+
   for (const patch of patchSet.patches) {
-    if (patch.status !== "READY") {
-      await logger.write(
-        `⚠️ Patch ${patch.id} skipped (status: ${patch.status})`
-      );
-      continue;
+    if (patch.status !== "READY") { await logger.write(`Patch ${patch.id} skipped (status: ${patch.status})`); continue; }
+    if (!patch.file || path.isAbsolute(patch.file) || patch.file.split(/[\\/]/).includes("..")) {
+      await logger.write(`Rejected patch ${patch.id}: unsafe target path ${patch.file}`); continue;
     }
+    const target = path.resolve(root, patch.file);
+    if (!target.startsWith(root + path.sep)) { await logger.write(`Rejected patch ${patch.id}: target escapes project root`); continue; }
+    let realTarget: string;
+    try { realTarget = await fs.realpath(target); } catch (e) { await logger.write(`Patch ${patch.id}: target unavailable: ${(e as Error).message}`); continue; }
+    if (!realTarget.startsWith(root + path.sep)) { await logger.write(`Rejected patch ${patch.id}: symlink target escapes project root`); continue; }
+    let current: string;
+    try { current = await fs.readFile(realTarget, "utf8"); } catch (e) { await logger.write(`Patch ${patch.id}: read failed: ${(e as Error).message}`); continue; }
+    if (!patch.original_block || !current.includes(patch.original_block)) { await logger.write(`Patch ${patch.id}: original block missing or empty; refusing unsafe replacement`); continue; }
 
-    const absoluteFile = path.resolve(projectRoot, patch.file);
-
-    // 1️⃣ Read the current file contents
-    let originalContent: string;
+    // Save the first pristine version only once per file per session.
+    const backupName = Buffer.from(path.relative(root, realTarget)).toString("hex") + ".bak";
+    const backupPath = path.join(backupDir, backupName);
     try {
-      originalContent = await fs.readFile(absoluteFile, "utf-8");
-    } catch (e) {
-      await logger.write(
-        `❌ Failed to read target file for patch ${patch.id}: ${(e as Error).message}`
-      );
-      continue;
-    }
-
-    // 2️⃣ Verify the original block is present
-    if (!originalContent.includes(patch.original_block)) {
-      await logger.write(
-        `❌ Original block not found for patch ${patch.id} in ${patch.file}. Skipping.`
-      );
-      continue;
-    }
-
-    // 3️⃣ Write a backup before mutating
-    const backupPath = `${absoluteFile}.leo-backup`;
-    try {
-      await fs.writeFile(backupPath, originalContent, "utf-8");
-    } catch (e) {
-      await logger.write(
-        `❌ Could not write backup for ${patch.file}: ${(e as Error).message}`
-      );
-      continue;
-    }
-
-    // 4️⃣ Perform the replacement
-    const patchedContent = originalContent.replace(
-      patch.original_block,
-      patch.patched_block
-    );
-
-    try {
-      await fs.writeFile(absoluteFile, patchedContent, "utf-8");
-      await logger.write(
-        `✅ Patched ${patch.file} — ${patch.commit_message} (patch ${patch.id})`
-      );
-    } catch (e) {
-      await logger.write(
-        `❌ Failed to write patched file for ${patch.file}: ${(e as Error).message}`
-      );
-      // Attempt to restore from backup if write failed
-      try {
-        await fs.writeFile(absoluteFile, originalContent, "utf-8");
-        await logger.write(`🔁 Restored original ${patch.file} from backup`);
-      } catch (_) {
-        // swallow – we already logged the failure
+      if (!backedUp.has(realTarget)) {
+        try { await fs.access(backupPath); } catch { await fs.writeFile(backupPath, current, { encoding: "utf8", flag: "wx", mode: 0o600 }); }
+        backedUp.add(realTarget);
       }
-    }
+      const updated = current.replace(patch.original_block, patch.patched_block);
+      const temp = `${realTarget}.${randomUUID()}.leo-tmp`;
+      await fs.writeFile(temp, updated, { encoding: "utf8", mode: (await fs.stat(realTarget)).mode });
+      await fs.rename(temp, realTarget);
+      await logger.write(`Patched ${patch.file}: ${patch.commit_message} (${patch.id})`);
+      applied++;
+    } catch (e) { await logger.write(`Patch ${patch.id} failed: ${(e as Error).message}`); }
   }
+  return applied;
 }

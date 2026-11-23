@@ -1,202 +1,97 @@
-# Usage Guide
+# Leo Usage Guide
 
-## Installation
+## Setup
 
-```bash
+```powershell
 npm install -g @leo-agent/cli
-```
-
-Verify it works:
-
-```bash
-leo --version
-```
-
-## First-Time Setup
-
-### 1. Get an API Key
-
-Leo uses OpenRouter to access LLM models. Get a free API key at [openrouter.ai/keys](https://openrouter.ai/keys).
-
-### 2. Run the Configuration Wizard
-
-```bash
 leo config
 ```
 
-You'll be prompted for:
-- **API Key** — your OpenRouter key
-- **Model** — choose from the list or enter a custom model ID
-- **Scan Depth** — quick, deep, or paranoid
+Alternatively set `OPENROUTER_API_KEY` in your environment. Leo requires Node.js 20+.
 
-### 3. Launch the Interactive UI
+## Scan a project
 
-```bash
-leo
-```
+Run from the repository root:
 
-The TUI will show:
-- Session picker (resume past scans or start new)
-- Live scan dashboard with phase tracking
-- Real-time step log
-- Results view with score interpretation
-
----
-
-## Commands
-
-### `leo scan` — Headless Scan
-
-Run a full scan without the interactive UI:
-
-```bash
-# Default scan
+```powershell
 leo scan
-
-# Not working? Try npx
-npx @leo-agent/cli scan
 ```
 
-Output example:
-```
-🚀 Starting Leo scan…
-✓  Config loaded
-✓  Session a1b2c3 created
-✓  Memory loaded — 1 patterns
-✓  Snapshot built — 71 files
-✓  Recon — 4 entry points
-✓  Exploit — 2 scenarios
-✓  Audit — 3 findings
-✓  Patches — 1 applied
+Leo captures source files and dependency manifests, splits them into deterministic bounded batches, and runs Recon, Exploit, and Audit on each batch. A global correlation pass deduplicates findings and looks for multi-file chains. Static taint heuristics and OSV dependency advisory checks add non-LLM evidence. A separate verifier marks findings `confirmed`, `rejected`, or `needs_review`.
 
-=== Scan Complete ===
-Session ID: a1b2c3
-Findings discovered: 5
-Patches applied: 1
-Scores: { coverage_score: 1, precision_score: 0.2, ... }
+## Read results
+
+Open the latest session under:
+
+```text
+~/.leo/sessions/<project-hash>/<session-id>/
 ```
 
-### `leo config` — Configuration
+Key files:
 
-Interactively set or update your configuration:
+| File | Purpose |
+|---|---|
+| `audit.json` | Retained candidate findings and verification status |
+| `verification.json` | Independent verifier decisions and rationales |
+| `taint_report.json` | Deterministic source-to-sink candidates |
+| `project_analysis.json` | Resolved TypeScript module graph, flow graphs, parser availability, and explicit analysis limitations |
+| `dependency_audit.json` | OSV query count, advisory findings, and network errors |
+| `correlations.json` | Cross-file attack chains supported by existing findings |
+| `batch_manifest.json` | Batch layout and file coverage |
+| `snapshot_manifest.json` | Snapshot hash and skipped files |
+| `patches.json` | Proposed patches for confirmed findings |
 
-```bash
-leo config
+`needs_review` is not equivalent to confirmed. Rejected candidates remain in `audit.json`'s `rejected_findings` list with a reason.
+
+## Resume
+
+```powershell
+leo resume <session-id>
 ```
 
-To check current config:
+Leo reuses a batch checkpoint only if the project snapshot hash matches the original session. Missing or corrupt checkpoints are recomputed. A changed source snapshot is rejected rather than mixed with stale findings.
 
-```bash
-cat ~/.leo/config.json
+## Patch safety
+
+Patch application is disabled by default. Leo proposes patches for independently confirmed findings, saves them for review, and does not modify source files unless `auto_apply_patches` is explicitly enabled. Commit or back up your work before opting into patch application. Restore from a session with:
+
+```powershell
+leo restore <session-id>
 ```
 
-### `leo history` — Past Sessions
+## Dependency audit caveats
 
-List all previous scans for the current project:
+OSV lookups require network access. The audit reports `complete`, `partial`, or `unavailable`, along with how many exact dependency versions were queried. An unavailable lookup is not evidence that dependencies are safe. Version ranges and unsupported lockfile formats may not be resolvable.
 
-```bash
-leo history
+## Test the built-in rules
+
+From the Leo source checkout:
+
+```powershell
+npm test
 ```
 
-### `leo status` — Latest Session
+The fixture suite measures TP/FP/TN/FN, precision, recall, and F1 for deterministic heuristic rules. These figures do not measure the LLM agents or end-to-end benchmark performance.
 
-Show a summary of the most recent scan:
+## Evaluate a labeled audit
 
-```bash
-leo status
+Use a ground-truth JSON array and an `audit.json` from a completed scan:
+
+```powershell
+leo evaluate .\fixtures\security\ground-truth.json .\path\to\audit.json
 ```
 
-### `leo restore` — Rollback Patches
+Rows require `id`, `file`, and `expected` (`vulnerable` or `safe`). Vulnerable rows can include `category` and `line`. The evaluator reports TP/FP/TN/FN, precision, recall, F1, matched findings, and unscored findings. Its default line tolerance is five lines.
 
-If a patch caused issues, restore the original files:
+### Understanding AST findings
 
-```bash
-# Restore from the latest session
-leo restore
+For JavaScript and TypeScript, inspect the finding's `evidence` JSON. `source_origins` identifies attacker-controlled expressions, `sink` identifies the dangerous operation, and `analysis` identifies the TypeScript compiler AST engine. Verification records may include `attacker_controlled_source`, `propagation_path`, `security_boundary`, `exploitable_sink`, and `mitigations_reviewed`. A `needs_review` disposition is not a confirmed vulnerability.
 
-# Restore from a specific session
-leo restore a1b2c3
-```
+## Project AST analysis requirements
 
-Restore works by copying `.leo-backup` files back over the patched originals.
+- JavaScript/TypeScript analysis uses the bundled TypeScript compiler dependency.
+- Python AST analysis requires `python3` or `python` on PATH.
+- Java AST extraction requires a JDK with both `javac` and `java` on PATH. A JRE-only installation is insufficient.
+- If an optional language runtime/parser is unavailable, Leo records that status; absence of findings is not evidence that the language is safe.
 
-### `leo reset` — Clear Data
-
-Delete all session data for the current project:
-
-```bash
-leo reset
-```
-
-This removes `~/.leo/sessions/<project-hash>/` — the memory DB and config are not affected.
-
----
-
-## Interactive TUI (recommended)
-
-Running `leo` without any subcommand launches the terminal UI:
-
-### Session Picker
-
-Select a previous session to review, or start a fresh scan.
-
-### Live Scan Dashboard
-
-During a scan, you'll see:
-
-```
-─ Preparation ─
-  ✓  Config
-  ✓  Snapshot     71 files
-  ✓  Memory       1 patterns
-─ Analysis & Exploitation ─
-  ✓  Recon        4 entry points
-  ⠏  Exploit      Running…
-  ⠇  Audit        Running…
-```
-
-A real-time **Step Log** panel shows detailed progress messages.
-
-### Results View
-
-After completion, scores are displayed with interpretation:
-
-```
-┌─ Scores ─────────────────────────────────────┐
-│ Coverage     ██████████  100%  (Excellent)   │
-│ Precision    ████░░░░░░  40%   (Fair)        │
-│ Patch Rate   █████░░░░░  50%   (Fair)        │
-│ Overall      ███████░░░  72%   (Good)        │
-└──────────────────────────────────────────────┘
-```
-
----
-
-## Override Options
-
-Pass these before the subcommand:
-
-```bash
-leo --model anthropic/claude-sonnet-4-5 scan
-leo --depth paranoid scan
-```
-
----
-
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| `API key missing` | Run `leo config` to set your key |
-| `Rate limit exceeded` | Add credits at [openrouter.ai](https://openrouter.ai) |
-| `Scan interrupted` | Process was killed (Ctrl+C). Run again |
-| `0 findings` | The model might need a more detailed prompt. Try `paranoid` depth |
-| Patch broke something | Run `leo restore` to rollback |
-
-## Best Practices
-
-1. **Commit your code** before running Leo — patches modify files in place
-2. **Start with `quick` depth** on a new project to test the pipeline
-3. **Review logs** in `~/.leo/sessions/<hash>/log.txt` for full details
-4. **Use the memory DB** — Leo learns across sessions, so repeated scans get smarter
-5. **Run on CI** with `leo scan` for automated security auditing in your pipeline
+For cross-file TypeScript findings, `audit.json` evidence includes `source_file` and `source_origins`. The independent verifier receives the caller-side source excerpt and the callee-side sink excerpt.

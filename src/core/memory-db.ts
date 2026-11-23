@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import path from "node:path";
 import { promises as fs } from "node:fs";
+import { projectHash } from "../utils/hash.js";
 
 /**
  * Singleton wrapper around better‑sqlite3 that ensures the DB file exists
@@ -15,13 +16,16 @@ export class MemoryDB {
     this.ensureSchema();
   }
 
-  static async getInstance(): Promise<MemoryDB> {
-    if (!MemoryDB.instance) {
-      const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
-      const dir = path.join(home, ".leo");
-      await fs.mkdir(dir, { recursive: true });
-      const dbPath = path.join(dir, "memory.db");
+  static async getInstance(projectRoot: string): Promise<MemoryDB> {
+    // Memory is scoped per canonical project so one repository cannot influence another.
+    const home = process.env.HOME ?? process.env.USERPROFILE ?? process.cwd();
+    const dir = path.join(home, ".leo", "projects", projectHash(projectRoot));
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    const dbPath = path.join(dir, "memory.db");
+    if (!MemoryDB.instance || (MemoryDB as any).instancePath !== dbPath) {
+      if (MemoryDB.instance) MemoryDB.instance.db.close();
       MemoryDB.instance = new MemoryDB(dbPath);
+      (MemoryDB as any).instancePath = dbPath;
     }
     return MemoryDB.instance;
   }
@@ -88,6 +92,11 @@ export class MemoryDB {
       VALUES (@id, @pattern_name, @description, @attack_class, @code_signatures, @languages, @created_at, @created_at)`
     );
     stmt.run(params);
+  }
+
+  getPatternIdByName(patternName: string): string | undefined {
+    const row = this.db.prepare("SELECT id FROM vulnerability_patterns WHERE pattern_name = ? LIMIT 1").get(patternName);
+    return row?.id;
   }
 
   // Return top‑N patterns ordered by confidence_weight DESC

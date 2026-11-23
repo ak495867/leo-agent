@@ -60,6 +60,8 @@ export async function runRecon(
     root: snapshot.root,
     file_count: snapshot.file_count,
     directory_tree: snapshot.directory_tree,
+    files: snapshot.files,
+    skipped_files: snapshot.skipped_files,
     top_patterns: topPatterns.map((p) => ({
       pattern_name: p.pattern_name,
       description: p.description,

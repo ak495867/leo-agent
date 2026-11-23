@@ -1,7 +1,7 @@
 {
   "name": "@leo-agent/cli",
-  "version": "0.1.0",
-  "description": "Autonomous security auditing CLI — multi-agent LLM-powered vulnerability scanner",
+  "version": "1.0.0",
+  "description": "Evidence-driven multi-agent security auditor with bounded context-sensitive analysis, path solving, sandbox validation and reproducible benchmarks",
   "main": "dist/index.js",
   "bin": {
     "leo": "./bin/leo"
@@ -10,7 +10,10 @@
     "dist",
     "bin",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG-0.6.0.md",
+    "docs",
+    "CHANGELOG-1.0.0.md"
   ],
   "engines": {
     "node": ">=20.0.0"
@@ -18,7 +21,8 @@
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run build",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "keywords": [
     "security",
@@ -46,12 +50,12 @@
     "ink": "^3.2.0",
     "ink-select-input": "^4.0.0",
     "ink-spinner": "^4.0.3",
-    "ink-text-input": "^4.0.0-0"
+    "ink-text-input": "^4.0.0-0",
+    "typescript": "^5.9.3"
   },
   "devDependencies": {
     "@types/glob": "^8.1.0",
     "@types/node": "^20.11.30",
-    "@types/react": "^18.2.0",
-    "typescript": "^5.3.3"
+    "@types/react": "^18.2.0"
   }
 }

@@ -26,13 +26,7 @@ export interface MemoryUpdate {
     reason: string;
     code_context: string;
   }>;
-  session_score: {
-    coverage_score: number;
-    precision_score: number;
-    patch_success_rate: number;
-    novelty_score: number;
-    composite_score: number;
-  };
+  session_score?: null;
 }
 
 /**
@@ -47,21 +41,19 @@ export async function runMemory(
   exploit: ExploitMap,
   audit: AuditReport,
   patchSet: PatchSet,
-  sessionScore: { coverage_score: number; precision_score: number; patch_success_rate: number; novelty_score: number; composite_score: number },
+  sessionScore: Record<string, number | null>,
   config: LeoConfig,
   topPatterns: any[] = []
 ): Promise<MemoryUpdate | null> {
+  // Memory extraction is a summarization task; bound its payload so a large
+  // repository cannot fail an otherwise completed scan at the final stage.
   const userMsg = JSON.stringify({
-    recon,
-    exploit,
-    audit,
-    patchSet,
+    recon: { tech_stack: recon.tech_stack, entry_points: (recon.entry_points ?? []).slice(0, 80), trust_boundaries: (recon.trust_boundaries ?? []).slice(0, 80), dependencies: (recon.dependencies ?? []).slice(0, 120), complexity_hotspots: (recon.complexity_hotspots ?? []).slice(0, 60) },
+    exploit: { scenarios: (exploit.scenarios ?? []).slice(0, 80) },
+    audit: { findings: (audit.findings ?? []).slice(0, 100).map(f => ({ id: f.id, severity: f.severity, category: f.category, description: f.description, verification: f.verification })) },
+    patchSet: { patches: (patchSet.patches ?? []).slice(0, 50).map(p => ({ vulnerability_class: p.vulnerability_class, status: p.status, commit_message: p.commit_message })) },
     sessionScore,
-    top_patterns: topPatterns.map((p) => ({
-      pattern_name: p.pattern_name,
-      description: p.description,
-      attack_class: p.attack_class,
-    })),
+    top_patterns: topPatterns.slice(0, 50).map((p) => ({ pattern_name: p.pattern_name, description: p.description, attack_class: p.attack_class })),
   });
 
   return callJsonAgent<MemoryUpdate>(

@@ -1,13 +1,13 @@
 import React from 'react';
 import { Box, Text } from 'ink';
-import { colors, sym, SCORE_LABELS, interpretScore, progressBar } from './theme.js';
+import { colors, sym } from './theme.js';
 
 interface Props {
   result: {
     sessionId: string;
     totalFindings: number;
     patchesApplied: number;
-    scores: Record<string, number>;
+    scores: Record<string, number | null>;
   };
   onExit?: () => void;
 }
@@ -68,7 +68,7 @@ export const ResultView: React.FC<Props> = ({ result, onExit }) => {
         </Box>
       </Box>
 
-      {/* ── Score cards ──────────────────────────────── */}
+      {/* ── Operational audit summary ───────────────── */}
       <Box
         borderStyle="single"
         borderColor="gray"
@@ -78,29 +78,37 @@ export const ResultView: React.FC<Props> = ({ result, onExit }) => {
         paddingY={0}
       >
         <Box marginBottom={0}>
-          <Text bold>Scores</Text>
+          <Text bold>Audit Summary</Text>
         </Box>
-        {Object.entries(result.scores).map(([k, v]) => {
-          const label = SCORE_LABELS[k] ?? k;
-          const pct = (v * 100).toFixed(0);
-          const { label: interpretation, color } = interpretScore(v);
+        {([
+          ['files_analyzed', 'Files analyzed'],
+          ['files_skipped', 'Files skipped'],
+          ['batches_processed', 'Batches processed'],
+          ['exploit_scenarios', 'Exploit scenarios'],
+          ['findings_reported', 'Findings retained'],
+          ['verified_findings', 'Confirmed findings'],
+          ['needs_review_findings', 'Needs review'],
+          ['taint_candidates', 'Taint candidates'],
+          ['dependencies_queried', 'Dependencies queried'],
+          ['cross_file_chains', 'Cross-file chains'],
+          ['patches_proposed', 'Patches proposed'],
+          ['patches_applied', 'Patches applied'],
+        ] as Array<[string, string]>).map(([key, label]) => {
+          const value = result.scores[key];
+          if (typeof value !== 'number') return null;
           return (
-            <Box key={k}>
-              <Box width={14}>
-                <Text dimColor>{label}</Text>
-              </Box>
-              <Box width={14}>
-                <Text>{progressBar(v)}</Text>
-              </Box>
-              <Box width={6}>
-                <Text bold>{pct}%</Text>
-              </Box>
-              <Box>
-                <Text color={color}>({interpretation})</Text>
-              </Box>
+            <Box key={key}>
+              <Box width={25}><Text dimColor>{label}</Text></Box>
+              <Text bold>{value}</Text>
             </Box>
           );
         })}
+        <Box>
+          <Box width={25}><Text dimColor>OSV lookup</Text></Box>
+          <Text color={result.scores.dependency_scan_available === 1 ? colors.success : colors.warning}>
+            {result.scores.dependency_scan_available === 1 ? 'Available' : 'Unavailable / partial'}
+          </Text>
+        </Box>
       </Box>
 
       {onExit && (

@@ -1,0 +1,14 @@
+[
+  {
+    "id": "python-request-to-shell",
+    "file": "unsafe.py",
+    "expected": "vulnerable",
+    "source": "cmd = request.args.get('cmd')\nos.system(cmd)"
+  },
+  {
+    "id": "javascript-parameterized-sql",
+    "file": "safe-query.js",
+    "expected": "safe",
+    "source": "const id = req.query.id;\ndb.query('SELECT * FROM users WHERE id = ?', [id]);"
+  }
+]

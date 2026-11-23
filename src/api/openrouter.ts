@@ -18,61 +18,37 @@ export function estimateTokenCount(text: string): number {
  * Throws on HTTP errors or unexpected response shapes.
  */
 export async function callAgent(
-  systemPrompt: string,
-  userContent: string,
-  model: string,
-  apiKey: string
+  systemPrompt: string, userContent: string, model: string, apiKey: string
 ): Promise<string> {
   const combined = systemPrompt + "\n" + userContent;
   const estimatedTokens = estimateTokenCount(combined);
   if (estimatedTokens > 80_000) {
-    // Truncate user content until we're under the limit
-    const maxChars = 80_000 * CHARS_PER_TOKEN - systemPrompt.length - 500; // 500 safety margin
-    if (maxChars > 0 && userContent.length > maxChars) {
-      userContent =
-        userContent.slice(0, Math.floor(maxChars)) +
-        `\n\n[... truncated — original input was ~${estimatedTokens}K tokens]`;
-    } else {
-      throw new Error(
-        `Estimated token count (${estimatedTokens}) exceeds 80 K limit even after truncation. ` +
-        `System prompt alone may be too large.`
-      );
+    throw new Error(`Request rejected: estimated ${estimatedTokens.toLocaleString()} tokens exceeds Leo's 80,000-token safety budget. Split the scan into smaller batches; no source was silently truncated.`);
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120_000);
+  try {
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json", "HTTP-Referer": "https://github.com/ak495867/leo-agent", "X-Title": "Leo Security Agent" },
+      body: JSON.stringify({ model, temperature: 0.1, response_format: { type: "json_object" }, messages: [
+        { role: "system", content: systemPrompt }, { role: "user", content: userContent }
+      ] })
+    });
+    if (!response.ok) {
+      const txt = (await response.text()).slice(0, 2000);
+      throw new Error(`OpenRouter API error ${response.status}: ${txt}`);
     }
-  }
-
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "https://github.com/leo-agent/cli",
-      "X-Title": "Leo Security Agent"
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0.2,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userContent }
-      ]
-    })
-  });
-
-  if (!response.ok) {
-    const txt = await response.text();
-    throw new Error(`OpenRouter API error ${response.status}: ${txt}`);
-  }
-
-  const result: any = await response.json();
-  if (!result?.choices?.[0]?.message?.content) {
-    const preview = JSON.stringify(result).slice(0, 300);
-    throw new Error(
-      `OpenRouter returned an unexpected response structure. ` +
-      `Expected choices[0].message.content. Got: ${preview}`
-    );
-  }
-  return result.choices[0].message.content as string;
+    const result: any = await response.json();
+    const content = result?.choices?.[0]?.message?.content;
+    if (typeof content !== "string" || !content.trim()) throw new Error("OpenRouter returned an empty or unexpected response.");
+    return content;
+  } catch (err) {
+    if ((err as Error).name === "AbortError") throw new Error("OpenRouter request timed out after 120 seconds.");
+    throw err;
+  } finally { clearTimeout(timeout); }
 }
 
 /**
@@ -95,11 +71,15 @@ export async function callJsonAgent<T>(
     const content =
       attempt === 0
         ? userContent
-        : `You previously returned invalid JSON. The parse error was:\n${lastError}\n\nPlease fix your output and return ONLY valid JSON matching the required schema. No commentary.\n\nOriginal input:\n${userContent}`;
+        : `Your previous response was invalid JSON (${lastError}). Return only a corrected JSON object matching the requested schema. Do not repeat or modify the input data.\n\nInput follows:\n${userContent}`;
 
     const raw = await callAgent(systemPrompt, content, model, apiKey);
     try {
-      return JSON.parse(raw) as T;
+      const trimmed = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+      const first = trimmed.indexOf("{");
+      const last = trimmed.lastIndexOf("}");
+      if (first < 0 || last < first) throw new Error("No JSON object found in model response");
+      return JSON.parse(trimmed.slice(first, last + 1)) as T;
     } catch (e) {
       lastError = (e as Error).message;
       if (attempt === maxRetries) {
